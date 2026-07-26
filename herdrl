@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# herdrl - resilient wrapper around `herdr`, in the spirit of sshl.
+#
+# Usage:  herdrl --remote <host> [--session <name>] [other herdr options]
+#         herdrl --remote myhost --session my-session
+#
+# All arguments are passed through to `herdr` untouched. When --remote is
+# present:
+#   * auto-reconnects after MacBook sleep / network drops (2->10s backoff)
+#   * resets the local terminal on every disconnect
+#   * if run inside a parent herdr pane, mirrors the remote session's agents
+#     into the parent's agents sidebar (Remote Agent Watch plugin, bridge
+#     mode; remote socket discovered via `ssh <host> herdr session list`).
+#     The mirror keeps updating even while the client is reconnecting.
+# Without --remote it just execs `herdr` with the given args.
+#
+# Quit for good: detach/quit the remote herdr client cleanly (exit 0).
+# Force quit while waiting to reconnect: Ctrl-C.
+set -u
+
+# Override with HERDR_WATCH=/path/to/watch.sh if you cloned elsewhere.
+WATCH="${HERDR_WATCH:-$HOME/work/herdr-remote-agent-watch/watch.sh}"
+
+# Pull --remote / --session values out of the passthrough args.
+rhost="" session="default"
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    --remote)  rhost="${args[$((i + 1))]:-}" ;;
+    --session) session="${args[$((i + 1))]:-default}" ;;
+  esac
+  i=$((i + 1))
+done
+
+[ -n "$rhost" ] || exec herdr "$@"
+
+# Mirror the remote session's agents into the parent herdr sidebar.
+# Discovery must retry in the background: `herdr --remote` CREATES the
+# session on first attach, so at launch time `herdr session list` on the
+# host may not know it yet.
+if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] && [ -x "$WATCH" ]; then
+  (
+    for _ in $(seq 1 24); do
+      sock="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$rhost" "herdr session list" 2>/dev/null |
+        awk -v s="$session" '$1 == s {print $NF}')"
+      if [ -n "$sock" ]; then
+        bash "$WATCH" --remote "$rhost" "$sock" "$HERDR_PANE_ID"
+        exit 0
+      fi
+      sleep 5
+    done
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  trap 'bash "$WATCH" --stop "$HERDR_PANE_ID"' EXIT
+fi
+
+reset_term() {
+  # Same cleanup as sshl: kill mouse-tracking + bracketed paste, leave the
+  # alt screen, restore cursor/keypad/SGR, sanitize the tty.
+  printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l\033[?2004l\033[?1049l\033[?25h\033[?7h\033>\033[0m'
+  stty sane 2>/dev/null || true
+}
+
+attempt=0
+while true; do
+  herdr "$@"
+  rc=$?
+  reset_term
+
+  # rc 0 -> clean quit/detach; rc 130 -> Ctrl-C. Anything else -> drop; retry.
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ]; then
+    printf '\n\033[2m[herdrl] %s closed cleanly (rc=%s). Bye.\033[0m\n' "$rhost" "$rc"
+    exit 0
+  fi
+
+  attempt=$((attempt + 1))
+  delay=$((attempt * 2)); [ "$delay" -gt 10 ] && delay=10
+  printf '\n\033[33m[herdrl] %s lost (rc=%s). Reconnecting in %ss... (Ctrl-C to abort)\033[0m\n' \
+    "$rhost" "$rc" "$delay"
+  if ! sleep "$delay"; then
+    printf '\n\033[2m[herdrl] aborted.\033[0m\n'
+    exit 0
+  fi
+done
