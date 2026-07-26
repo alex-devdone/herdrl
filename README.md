@@ -51,6 +51,23 @@ The remote socket is discovered in the background via
 know about it yet. The mirror keeps updating even while the client is
 reconnecting, and is torn down when `herdrl` exits.
 
+## Does herdr already do this?
+
+Partly — checked against **herdr 0.7.5**:
+
+| this wrapper | upstream herdr |
+|---|---|
+| reconnect after a drop | No. Network drops "disconnect only the client instead of killing remote panes" — the server survives, the client dies and you restart it by hand. [#1779](https://github.com/ogulcancelik/herdr/issues/1779) (mosh transport, to survive sleep/roaming) was closed as not planned. |
+| terminal reset on disconnect | Attempted in [#939](https://github.com/ogulcancelik/herdr/issues/939), still reported on 0.7.3 — including `herdr --remote` on macOS, where mouse movement turns to garbage after a drop. |
+| remote agents in the local sidebar | Not yet — [#1170](https://github.com/ogulcancelik/herdr/issues/1170) is open. |
+
+herdr *does* handle **keepalive** itself: `[remote] manage_ssh_config = true`
+(the default) generates an ssh config adding `ServerAliveInterval` /
+`ServerAliveCountMax` when you haven't set them, plus ControlMaster
+multiplexing. That's complementary — this wrapper passes no ssh options of its
+own, so faster upstream drop detection just means the reconnect loop starts
+sooner.
+
 ## Quit vs drop
 
 | exit | meaning | wrapper does |
